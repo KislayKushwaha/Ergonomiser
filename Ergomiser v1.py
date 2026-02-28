@@ -56,11 +56,6 @@ pose = mp_pose.Pose(
 )
 
 # =====================================================
-# Neck View State (Sticky)
-# =====================================================
-neck_view_state = {'mode': 'front'}
-
-# =====================================================
 # Data Storage
 # =====================================================
 history = []
@@ -114,7 +109,6 @@ def process(frame, mirror=False):
             'wrist': angle(p['elbow'], p['wrist'], p['index']),
             'shoulder': angle(p['elbow'], p['shoulder'], p['hip']),
             'knee': angle(p['hip'], p['knee'], p['ankle']),
-            'neck': angle(p['ear'], p['shoulder'], p['hip'])
         }
     
     ls, rs = sides['left']['shoulder'], sides['right']['shoulder']
@@ -123,6 +117,33 @@ def process(frame, mirror=False):
     hip_mid = ((lh[0]+rh[0])//2, (lh[1]+rh[1])//2)
     vertical_ref = (hip_mid[0], hip_mid[1] + 100)
     trunk_angle = angle(shoulder_mid, hip_mid, vertical_ref)
+    
+    # =====================================================
+    # NEW: Face-based Neck Angle Calculation
+    # =====================================================
+    # Get face boundary points (ears are the most extreme face landmarks)
+    left_ear = sides['left']['ear']
+    right_ear = sides['right']['ear']
+    
+    # Face midpoint (center between ears)
+    face_mid = ((left_ear[0] + right_ear[0])//2, (left_ear[1] + right_ear[1])//2)
+    
+    # Determine which side the head is leaning towards
+    # If face_mid is to the left of shoulder_mid, head leans left (use left reference)
+    # If face_mid is to the right of shoulder_mid, head leans right (use right reference)
+    if face_mid[0] < shoulder_mid[0]:
+        # Head leans left - use left shoulder reference
+        shoulder_ref = (shoulder_mid[0] - 100, shoulder_mid[1])
+    else:
+        # Head leans right - use right shoulder reference
+        shoulder_ref = (shoulder_mid[0] + 100, shoulder_mid[1])
+    
+    # Calculate neck angle: face_mid -> shoulder_mid -> shoulder_ref
+    neck_angle_value = angle(face_mid, shoulder_mid, shoulder_ref)
+    
+    # =====================================================
+    # Visibility Detection
+    # =====================================================
     chosen = choose_side(lm)
     
     def is_side_visible(side):
@@ -141,43 +162,29 @@ def process(frame, mirror=False):
         else:
             right_visible = True
     
+    # =====================================================
+    # Draw Skeleton
+    # =====================================================
     mp_draw.draw_landmarks(
         out, res.pose_landmarks, mp_pose.POSE_CONNECTIONS,
         mp_draw.DrawingSpec(color=(100,100,100), thickness=1, circle_radius=2),
         mp_draw.DrawingSpec(color=(150,150,150), thickness=2)
     )
     
-    nose_pt = P(mp_pose.PoseLandmark.NOSE)
-    left_ear = sides['left']['ear']
-    right_ear = sides['right']['ear']
-    dl = np.linalg.norm(np.array(nose_pt) - np.array(left_ear))
-    dr = np.linalg.norm(np.array(nose_pt) - np.array(right_ear))
-    ear_ratio = min(dl, dr) / max(dl, dr)
+    # =====================================================
+    # Draw Neck Angle (with grey lines, colored arc only)
+    # =====================================================
+    # Draw grey lines manually (not using draw_angle_annotation's lines)
+    cv2.line(out, face_mid, shoulder_mid, (80,80,80), 1, cv2.LINE_AA)
+    cv2.circle(out, face_mid, 3, (80,80,80), -1)
     
-    FRONT_ENTER = 0.78
-    SIDE_ENTER = 0.65
-    if neck_view_state['mode'] == 'front':
-        if ear_ratio < SIDE_ENTER:
-            neck_view_state['mode'] = 'side'
-    else:
-        if ear_ratio > FRONT_ENTER:
-            neck_view_state['mode'] = 'front'
+    # Now draw the angle annotation (only arc and label will be colored)
+    draw_angle_annotation(out, face_mid, shoulder_mid, shoulder_ref, 
+                          neck_angle_value, "Neck", (255,200,100))
     
-    is_front_view = (neck_view_state['mode'] == 'front')
-    farthest_side = 'left' if dl > dr else 'right'
-    farthest_ear = left_ear if farthest_side == 'left' else right_ear
-    
-    if is_front_view:
-        draw_angle_annotation(out, nose_pt, shoulder_mid, hip_mid, 
-                              angle(nose_pt, shoulder_mid, hip_mid), "Neck", (255,200,100))
-    else:
-        if farthest_side == 'left' and left_visible:
-            draw_angle_annotation(out, farthest_ear, shoulder_mid, hip_mid, 
-                                  angle(farthest_ear, shoulder_mid, hip_mid), "L-Neck", (255,200,100))
-        if farthest_side == 'right' and right_visible:
-            draw_angle_annotation(out, farthest_ear, shoulder_mid, hip_mid, 
-                                  angle(farthest_ear, shoulder_mid, hip_mid), "R-Neck", (255,200,100))
-    
+    # =====================================================
+    # Draw Joint Angles
+    # =====================================================
     for side in ('left', 'right'):
         if side == 'left' and not left_visible:
             continue
@@ -195,13 +202,26 @@ def process(frame, mirror=False):
         draw_angle_annotation(out, pts['hip'], pts['knee'], pts['ankle'], 
                               ang['knee'], f"{lbl}-Knee", (150,255,150))
     
+    # =====================================================
+    # Draw Trunk Angle
+    # =====================================================
     draw_angle_annotation(out, shoulder_mid, hip_mid, vertical_ref, trunk_angle, "Trunk", (255,150,100))
     
+    # =====================================================
+    # Store Data
+    # =====================================================
     history.append({
         'time': time.time(),
+        'neck': neck_angle_value,
         'trunk': trunk_angle,
+        'left_shoulder': angles['left']['shoulder'],
+        'right_shoulder': angles['right']['shoulder'],
+        'left_elbow': angles['left']['elbow'],
+        'right_elbow': angles['right']['elbow'],
         'left_wrist': angles['left']['wrist'],
-        'right_wrist': angles['right']['wrist']
+        'right_wrist': angles['right']['wrist'],
+        'left_knee': angles['left']['knee'],
+        'right_knee': angles['right']['knee']
     })
     return out
 
@@ -274,3 +294,7 @@ cv2.destroyAllWindows()
 if history:
     Path("outputs").mkdir(exist_ok=True)
     pd.DataFrame(history).to_csv("outputs/joint_angles_report.csv", index=False)
+    print(f"\n✅ Analysis complete!")
+    print(f"📊 Data exported to: outputs/joint_angles_report.csv")
+    if writer:
+        print(f"🎥 Video saved to: outputs/annotated_video.mp4")
